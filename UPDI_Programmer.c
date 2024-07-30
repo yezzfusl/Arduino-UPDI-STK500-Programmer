@@ -1,6 +1,6 @@
 // UPDI_Programmer.c
 // STK500 compatible UPDI programmer firmware for Arduino
-// Version 1.2
+// Version 1.4
 
 #include <avr/io.h>
 #include <util/delay.h>
@@ -57,6 +57,10 @@
 // Buffer sizes
 #define MAX_BUFFER_SIZE 275
 
+// Error handling constants
+#define MAX_RETRIES 3
+#define RETRY_DELAY_MS 100
+
 // Function prototypes
 void uart_init(void);
 void uart_send_byte(uint8_t data);
@@ -74,6 +78,9 @@ void updi_write_cs(uint8_t address, uint8_t value);
 uint8_t updi_read_cs(uint8_t address);
 void updi_write_data(uint32_t address, uint8_t *data, uint16_t len);
 void updi_read_data(uint32_t address, uint8_t *data, uint16_t len);
+uint8_t updi_write_data_with_retry(uint32_t address, uint8_t *data, uint16_t len);
+uint8_t updi_read_data_with_retry(uint32_t address, uint8_t *data, uint16_t len);
+void log_error(const char *message);
 
 // Global variables
 uint8_t rx_buffer[MAX_BUFFER_SIZE];
@@ -231,7 +238,7 @@ void handle_sync_error(uint8_t attempt) {
     uint16_t backoff_time = (1 << attempt) * 100; // Exponential backoff in milliseconds
     if (backoff_time > 5000) backoff_time = 5000; // Cap at 5 seconds
 
-    // TODO: Implement error logging or reporting mechanism
+    log_error("UPDI synchronization failed");
     
     _delay_ms(backoff_time);
 }
@@ -253,7 +260,7 @@ void process_stk500_command(void) {
 
     // Receive token
     if (uart_receive_byte() != TOKEN) {
-        // Invalid token, discard message
+        log_error("Invalid STK500 token received");
         return;
     }
 
@@ -288,6 +295,7 @@ void process_stk500_command(void) {
             if (updi_sync()) {
                 stk500_send_response(STATUS_CMD_OK, NULL, 0);
             } else {
+                log_error("Failed to enter programming mode");
                 stk500_send_response(STATUS_CMD_FAILED, NULL, 0);
             }
             break;
@@ -305,22 +313,31 @@ void process_stk500_command(void) {
         case CMD_READ_FLASH:
             {
                 uint16_t num_bytes = (rx_buffer[0] << 8) | rx_buffer[1];
-                updi_read_data(current_address, tx_buffer, num_bytes);
-                stk500_send_response(STATUS_CMD_OK, tx_buffer, num_bytes);
-                current_address += num_bytes;
+                if (updi_read_data_with_retry(current_address, tx_buffer, num_bytes)) {
+                    stk500_send_response(STATUS_CMD_OK, tx_buffer, num_bytes);
+                    current_address += num_bytes;
+                } else {
+                    log_error("Failed to read flash memory");
+                    stk500_send_response(STATUS_CMD_FAILED, NULL, 0);
+                }
             }
             break;
 
         case CMD_WRITE_FLASH:
             {
                 uint16_t num_bytes = (rx_buffer[0] << 8) | rx_buffer[1];
-                updi_write_data(current_address, &rx_buffer[2], num_bytes);
-                stk500_send_response(STATUS_CMD_OK, NULL, 0);
-                current_address += num_bytes;
+                if (updi_write_data_with_retry(current_address, &rx_buffer[2], num_bytes)) {
+                    stk500_send_response(STATUS_CMD_OK, NULL, 0);
+                    current_address += num_bytes;
+                } else {
+                    log_error("Failed to write flash memory");
+                    stk500_send_response(STATUS_CMD_FAILED, NULL, 0);
+                }
             }
             break;
 
         default:
+            log_error("Unknown STK500 command received");
             stk500_send_response(STATUS_CMD_FAILED, NULL, 0);
             break;
     }
@@ -386,4 +403,97 @@ void updi_read_data(uint32_t address, uint8_t *data, uint16_t len) {
     for (uint16_t i = 0; i < len; i++) {
         data[i] = updi_receive_byte();
     }
+}
+
+// Write data to UPDI with retry mechanism
+uint8_t updi_write_data_with_retry(uint32_t address, uint8_t *data, uint16_t len) {
+    uint8_t retries = 0;
+    uint8_t success = 0;
+
+    while (retries < MAX_RETRIES && !success) {
+        updi_write_data(address, data, len);
+        
+        // Verify written data
+        uint8_t verify_buffer[len];
+        updi_read_data(address, verify_buffer, len);
+        
+        if (memcmp(data, verify_buffer, len) == 0) {
+            success = 1;
+        } else {
+            retries++;
+            log_error("UPDI write verification failed, retrying...");
+            _delay_ms(RETRY_DELAY_MS);
+        }
+    }
+
+    return success;
+}
+
+// Read data from UPDI with retry mechanism
+uint8_t updi_read_data_with_retry(uint32_t address, uint8_t *data, uint16_t len) {
+    uint8_t retries = 0;
+    uint8_t success = 0;
+
+    while (retries < MAX_RETRIES && !success) {
+        updi_read_data(address, data, len);
+        
+        // Verify read data (read twice and compare)
+        uint8_t verify_buffer[len];
+        updi_read_data(address, verify_buffer, len);
+        
+        if (memcmp(data, verify_buffer, len) == 0) {
+            success = 1;
+        } else {
+            retries++;
+            log_error("UPDI read verification failed, retrying...");
+            _delay_ms(RETRY_DELAY_MS);
+        }
+    }
+
+    return success;
+}
+
+// Log error message (placeholder implementation)
+void log_error(const char *message) {
+    // For now, we'll just send it over UART for debugging purposes.
+    while (*message) {
+        uart_send_byte(*message++);
+    }
+    uart_send_byte('\r');
+    uart_send_byte('\n');
+}
+
+// CRC16 calculation for error checking
+uint16_t calculate_crc16(uint8_t *data, uint16_t length) {
+    uint16_t crc = 0xFFFF;
+    for (uint16_t i = 0; i < length; i++) {
+        crc ^= (uint16_t)data[i];
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x0001) {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+// Advanced error recovery function
+void perform_error_recovery(void) {
+    log_error("Performing error recovery...");
+    
+    // Reset UPDI interface
+    updi_send_break();
+    
+    // Re-synchronize
+    if (!updi_sync()) {
+        log_error("Error recovery failed: unable to re-synchronize UPDI");
+        return;
+    }
+    
+    // Reset device (if applicable)
+    // TODO: Implement device-specific reset procedure
+    
+    log_error("Error recovery complete");
 }
